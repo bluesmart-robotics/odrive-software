@@ -11,6 +11,43 @@
 #include <communication/interface_i2c.h>
 #include <communication/interface_can.hpp>
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include <math.h>  // pour powf, fabsf
+
+// ===== RC Differential Mixer (config locale simple) =====
+// Si tu veux désactiver le mixage sans recompiler, commente ENABLE_RC_MIXER.
+#define ENABLE_RC_MIXER 1
+
+// Hypothèse de mappage (comme ton script Python) :
+// - GPIO3 (PA2/TIM5_CH3) -> axis0.controller.input_pos  (STEERING)
+// - GPIO4 (PA3/TIM5_CH4) -> axis1.controller.input_pos  (THROTTLE)
+static const int RC_AXIS_STEERING = 0;  // axis0
+static const int RC_AXIS_THROTTLE = 1;  // axis1
+
+// Paramètres du mixage
+static float RC_MAX_TORQUE        = 5.0f;   // Nm max (comme ton script)
+static float RC_DEADZONE_STEERING  = 0.005f; // [-]  ~±0.5%
+static float RC_DEADZONE_THROTTLE  = 0.05f;  // [-]  ~±5%
+static float RC_STEERING_GAIN      = 0.5f;   // k : 0.5 => moitié du braquage dans le diff
+static float RC_EXPO_GAMMA         = 1.4f;   // expo sur le steering (>=1 lin->plus dur)
+
+// Helpers
+static inline float apply_deadzone(float x, float dz) {
+    return (fabsf(x) < dz) ? 0.0f : x;
+}
+static inline float expo_signed(float x, float gamma) {
+    if (gamma <= 1.0001f) return x;
+    return (x >= 0.0f) ? powf(x, gamma) : -powf(-x, gamma);
+}
+static inline float clamp01s(float x) { // clamp à [-1..+1]
+    if (x >  1.0f) return  1.0f;
+    if (x < -1.0f) return -1.0f;
+    return x;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 osSemaphoreId sem_usb_irq;
 osMessageQId uart_event_queue;
 osMessageQId usb_event_queue;
@@ -399,6 +436,62 @@ void ODrive::control_loop_cb(uint32_t timestamp) {
         uart_poll();
         odrv.oscilloscope_.update();
     }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    #if ENABLE_RC_MIXER
+    // --- RC Differential Mixer ---
+    // Hypothèses nécessaires côté config utilisateur (via odrivetool/GUI) :
+    // 1) gpio3_mode = PWM ; gpio4_mode = PWM
+    // 2) gpio3_pwm_mapping -> axis0.controller.input_pos   (STEERING)
+    //    gpio4_pwm_mapping -> axis1.controller.input_pos   (THROTTLE)
+    // 3) Les 2 axes sont en CONTROL_MODE_TORQUE_CONTROL et INPUT_MODE_PASSTHROUGH
+    //
+    // Le mixage écrit input_torque sur les 2 axes AVANT controller_.update().
+
+    Axis& axis_steer   = axes[RC_AXIS_STEERING];
+    Axis& axis_throttle= axes[RC_AXIS_THROTTLE];
+
+    // Vérifs de base: closed-loop et pas d'erreurs bloquantes
+    bool axes_ready =
+        (axis_steer.current_state_    == Axis::AXIS_STATE_CLOSED_LOOP_CONTROL) &&
+        (axis_throttle.current_state_ == Axis::AXIS_STATE_CLOSED_LOOP_CONTROL) &&
+        (axis_steer.error_    == Axis::ERROR_NONE) &&
+        (axis_throttle.error_ == Axis::ERROR_NONE) &&
+        (axis_steer.controller_.config_.control_mode == Controller::CONTROL_MODE_TORQUE_CONTROL) &&
+        (axis_throttle.controller_.config_.control_mode == Controller::CONTROL_MODE_TORQUE_CONTROL) &&
+        (axis_steer.controller_.config_.input_mode == Controller::INPUT_MODE_PASSTHROUGH) &&
+        (axis_throttle.controller_.config_.input_mode == Controller::INPUT_MODE_PASSTHROUGH);
+
+    if (axes_ready) {
+        // Lecture des deux voies déjà mappées dans input_pos ([-1..+1])
+        float steering = axis_steer.controller_.input_pos_;
+        float throttle = axis_throttle.controller_.input_pos_;
+
+        // Deadzones
+        steering = apply_deadzone(steering, RC_DEADZONE_STEERING);
+        throttle = apply_deadzone(throttle, RC_DEADZONE_THROTTLE);
+
+        // Expo et gain sur la direction
+        float s = expo_signed(steering, RC_EXPO_GAMMA);
+
+        // Différentiel (couples normalisés)
+        float left_n  = clamp01s(throttle + RC_STEERING_GAIN * s);
+        float right_n = clamp01s(throttle - RC_STEERING_GAIN * s);
+
+        // Application du couple
+        axis_steer.controller_.input_torque_    = left_n  * RC_MAX_TORQUE;  // axis0
+        axis_throttle.controller_.input_torque_ = right_n * RC_MAX_TORQUE;  // axis1
+    } else {
+        // Si non prêt: sécuriser le couple à 0 (optionnel)
+        axes[0].controller_.input_torque_ = 0.0f;
+        axes[1].controller_.input_torque_ = 0.0f;
+    }
+    // --- fin RC mixer ---
+    #endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 
     for (auto& axis : axes) {
         MEASURE_TIME(axis.task_times_.endstop_update) {
